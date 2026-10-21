@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sledge change-order extraction</title>
+  <style>
+    body { margin: 0; font: 16px/1.45 system-ui, sans-serif; background: #f6f5f2; color: #1c1915; }
+    .page { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 22px; max-width: 1180px; margin: 0 auto; padding: 28px 18px 64px; align-items: start; }
+    aside { position: sticky; top: 18px; }
+    aside h1 { font-size: 1.35rem; margin: 0 0 14px; }
+    aside h2 { font-size: 0.95rem; margin: 16px 0 8px; }
+    aside p, aside li { margin: 0 0 8px; color: #4d463c; font-size: 0.92rem; }
+    aside ol, aside ul { margin: 0; padding-left: 1.15rem; }
+    main { min-width: 0; }
+    section { background: #fff; border: 1px solid #e2ddd4; border-radius: 8px; padding: 16px; margin: 0 0 16px; }
+    h2 { font-size: 1.05rem; margin: 0 0 12px; }
+    .field { display: grid; grid-template-columns: 1.1fr 2fr 110px 80px auto; gap: 8px; margin-bottom: 8px; align-items: end; }
+    label.small { font-size: 0.78rem; color: #5c554b; display: block; margin-bottom: 3px; }
+    input, select, textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 7px 8px; border: 1px solid #cfc8bc; border-radius: 6px; background: #fff; }
+    textarea, pre.text { min-height: 140px; }
+    textarea { resize: vertical; }
+    button { font: inherit; border: 0; border-radius: 6px; padding: 8px 12px; background: #24362e; color: #fff; cursor: pointer; }
+    button.secondary { background: #efeae2; color: #1c1915; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+    .error { background: #fde8e4; border: 1px solid #e3b2a8; padding: 10px 12px; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; vertical-align: top; padding: 8px 6px; border-bottom: 1px solid #eee6da; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #1c1915; color: #f6f5f2; padding: 12px; border-radius: 8px; }
+    @media (max-width: 980px) {
+      .page { grid-template-columns: 1fr; }
+      aside { position: static; }
+      .field { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+<aside>
+  <h1>Sledge change-order extraction</h1>
+  <h2>How it works</h2>
+  <p>Upload a PDF or paste text, add the fields and descriptions you want, then extract.</p>
+  <ol>
+    <li>The PDF text is read first. Scanned pages go through OCR. Pasted text is used as-is.</li>
+    <li>Gemini fills only the fields you defined.</li>
+    <li>The result is JSON: a value, a short evidence quote, and a heuristic confidence score.</li>
+  </ol>
+  <h2>What it uses</h2>
+  <ul>
+    <li><strong>Python / FastAPI</strong> handles the request and runs the workflow.</li>
+    <li><strong>PyMuPDF</strong> reads embedded PDF text and renders pages.</li>
+    <li><strong>Tesseract OCR</strong> reads scanned pages.</li>
+    <li><strong>Gemini 3.1 Flash Lite</strong> extracts the requested fields. The key stays on the server.</li>
+    <li><strong>Validation</strong> checks each value, its type, and whether the evidence is in the document.</li>
+    <li><strong>This page</strong> is where you define fields, upload a document, and read the result.</li>
+  </ul>
+</aside>
+<main>
+
+  <section>
+    <h2>1. Document</h2>
+    <label class="small" for="pdf">PDF</label>
+    <input id="pdf" type="file" accept="application/pdf,.pdf">
+    <label class="small" for="text">Or paste text</label>
+    <textarea id="text" placeholder="Change Order No: CO-104&#10;Issued: March 3, 2024&#10;Additional cost: USD 4500"></textarea>
+    <div class="row">
+      <button id="show-text" type="button">Show extracted text</button>
+      <span id="read-status"></span>
+    </div>
+    <pre id="document-text" class="text" hidden></pre>
+  </section>
+
+  <section>
+    <h2>2. Fields</h2>
+    <div id="fields"></div>
+    <button class="secondary" id="add-field" type="button">Add field</button>
+  </section>
+
+  <section>
+    <h2>3. Extract</h2>
+    <div class="row">
+      <button id="extract" type="button">Extract</button>
+      <span id="status"></span>
+    </div>
+    <div id="error"></div>
+    <div id="results" hidden>
+      <div class="row">
+        <button class="secondary" id="copy" type="button">Copy JSON</button>
+      </div>
+      <div id="summary"></div>
+      <pre id="json"></pre>
+    </div>
+  </section>
+</main>
+</div>
+<script>
+const EXAMPLES = [
+  { name: "change_order_number", description: "The change order identifier printed on the document.", type: "string", required: true },
+  { name: "issue_date", description: "The date the change order was issued.", type: "date", required: false },
+  { name: "additional_cost", description: "The additional cost written on the change order. Do not calculate a new total.", type: "number", required: false },
+  { name: "approved", description: "Whether the change order is marked approved.", type: "boolean", required: false }
+];
+
+const fieldsEl = document.querySelector("#fields");
+const statusEl = document.querySelector("#status");
+const errorEl = document.querySelector("#error");
+const resultsEl = document.querySelector("#results");
+const summaryEl = document.querySelector("#summary");
+const jsonEl = document.querySelector("#json");
+const documentText = document.querySelector("#document-text");
+let lastResult = null;
+
+function fieldRow(field) {
+  const row = document.createElement("div");
+  row.className = "field";
+  row.innerHTML = `
+    <div><label class="small">Name</label><input class="name"></div>
+    <div><label class="small">Description</label><input class="description"></div>
+    <div><label class="small">Type</label>
+      <select class="type">
+        <option>string</option><option>number</option><option>date</option><option>boolean</option>
+      </select>
+    </div>
+    <div><label class="small">Required</label><input class="is-required" type="checkbox"></div>
+    <div><button class="secondary remove" type="button">Remove</button></div>`;
+  row.querySelector(".name").value = field.name || "";
+  row.querySelector(".description").value = field.description || "";
+  row.querySelector(".type").value = field.type || "string";
+  row.querySelector(".is-required").checked = field.required === true;
+  row.querySelector(".remove").addEventListener("click", () => row.remove());
+  fieldsEl.appendChild(row);
+}
+
+function collectFields() {
+  return [...fieldsEl.querySelectorAll(".field")].map((row) => ({
+    name: row.querySelector(".name").value.trim(),
+    description: row.querySelector(".description").value.trim(),
+    type: row.querySelector(".type").value,
+    required: row.querySelector(".is-required").checked
+  }));
+}
+
+function documentBody() {
+  const body = new FormData();
+  const file = document.querySelector("#pdf").files[0];
+  const pasted = document.querySelector("#text").value;
+  if (file) body.set("file", file);
+  else if (pasted.trim()) body.set("text", pasted);
+  return body;
+}
+
+function showError(message) {
+  errorEl.replaceChildren();
+  const note = document.createElement("p");
+  note.className = "error";
+  note.textContent = message;
+  errorEl.appendChild(note);
+}
+
+function addText(parent, tag, text) {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+
+function render(result) {
+  lastResult = result;
+  summaryEl.replaceChildren();
+  addText(summaryEl, "p", "Confidence scores are heuristic and uncalibrated.");
+  const table = document.createElement("table");
+  const head = document.createElement("tr");
+  ["Field", "Value", "Confidence", "Evidence"].forEach((label) => addText(head, "th", label));
+  const thead = document.createElement("thead");
+  thead.appendChild(head);
+  const tbody = document.createElement("tbody");
+  Object.entries(result.data || {}).forEach(([name, field]) => {
+    const row = document.createElement("tr");
+    const shown = field.value === null || field.value === undefined ? "null" : String(field.value);
+    const currency = field.currency ? ` ${field.currency}` : "";
+    [name, shown + currency, String(field.confidence), field.evidence || ""].forEach((cell) => {
+      addText(row, "td", cell);
+    });
+    tbody.appendChild(row);
+  });
+  table.append(thead, tbody);
+  summaryEl.appendChild(table);
+  addText(summaryEl, "h2", "Validation");
+  const errors = result.validation_errors || [];
+  if (!errors.length) addText(summaryEl, "p", "None.");
+  else {
+    const list = document.createElement("ul");
+    errors.forEach((item) => {
+      const where = item.field ? `${item.field}: ` : "";
+      addText(list, "li", where + item.message);
+    });
+    summaryEl.appendChild(list);
+  }
+  addText(summaryEl, "h2", "Document warnings");
+  const warnings = result.document_warnings || [];
+  if (!warnings.length) addText(summaryEl, "p", "None.");
+  else {
+    const list = document.createElement("ul");
+    warnings.forEach((item) => addText(list, "li", item));
+    summaryEl.appendChild(list);
+  }
+  jsonEl.textContent = JSON.stringify(result, null, 2);
+  resultsEl.hidden = false;
+}
+
+EXAMPLES.forEach(fieldRow);
+document.querySelector("#add-field").addEventListener("click", () => fieldRow({ type: "string", required: false }));
+
+document.querySelector("#show-text").addEventListener("click", async () => {
+  const button = document.querySelector("#show-text");
+  const readStatus = document.querySelector("#read-status");
+  errorEl.replaceChildren();
+  const body = documentBody();
+  if (!body.has("file") && !body.has("text")) {
+    showError("Upload a PDF or paste text first.");
+    return;
+  }
+  button.disabled = true;
+  readStatus.textContent = "Reading…";
+  try {
+    const response = await fetch("/api/read", { method: "POST", body });
+    const payload = await response.json();
+    if (!response.ok) {
+      showError(payload.error || "Could not read the document.");
+      documentText.hidden = true;
+      return;
+    }
+    documentText.textContent = payload.text || "";
+    documentText.hidden = false;
+  } catch (err) {
+    showError("The request could not be completed.");
+  } finally {
+    button.disabled = false;
+    readStatus.textContent = "";
+  }
+});
+
+document.querySelector("#extract").addEventListener("click", async () => {
+  const button = document.querySelector("#extract");
+  errorEl.replaceChildren();
+  resultsEl.hidden = true;
+  const body = documentBody();
+  if (!body.has("file") && !body.has("text")) {
+    showError("Upload a PDF or paste text first.");
+    return;
+  }
+  body.set("fields", JSON.stringify(collectFields()));
+  button.disabled = true;
+  statusEl.textContent = "Extracting…";
+  try {
+    const response = await fetch("/api/extract", { method: "POST", body });
+    const payload = await response.json();
+    if (!response.ok) {
+      showError(payload.error || "Extraction failed.");
+      return;
+    }
+    render(payload);
+  } catch (err) {
+    showError("The request could not be completed.");
+  } finally {
+    button.disabled = false;
+    statusEl.textContent = "";
+  }
+});
+
+document.querySelector("#copy").addEventListener("click", async () => {
+  if (!lastResult) return;
+  const text = JSON.stringify(lastResult, null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    statusEl.textContent = "Copied.";
+  } catch (err) {
+    const range = document.createRange();
+    range.selectNodeContents(jsonEl);
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    statusEl.textContent = "JSON selected. Press Ctrl+C to copy.";
+  }
+});
+</script>
+</body>
+</html>

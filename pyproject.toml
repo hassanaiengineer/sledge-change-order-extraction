@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sledge-extractor"
+version = "0.1.0"
+description = "Extract text and validated change-order fields from PDFs."
+requires-python = ">=3.10"
+dependencies = [
+    # PyMuPDF 2.x is a different distribution and installs unused packages.
+    "pymupdf>=1.24,<2",
+    "pytesseract>=0.3.10",
+    "pillow>=10",
+    # Used only by the layout OCR service.
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "python-multipart>=0.0.12",
+    "google-genai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sledge_extractor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
